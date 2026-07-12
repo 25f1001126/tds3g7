@@ -151,11 +151,33 @@ def extract_due_in_days(text: str) -> int:
     if net_match:
         return int(net_match.group(1))
 
-    unit_map = {"day": 1, "week": 7, "month": 30, "year": 365}
+    unit_map = {"day": 1, "week": 7, "fortnight": 14, "month": 30, "year": 365}
+    unit_alt = r"(day|week|fortnight|month|year)s?"
+
+    # "within/in/due in <N> days", "payable within <N> days"
     phrase_match = re.search(
-        r"(?:within|in|due in)\s+([a-zA-Z0-9\- ]+?)\s+(day|week|month|year)s?\b",
+        rf"(?:within|in|due in|payable within)\s+([a-zA-Z0-9\- ]+?)\s+{unit_alt}\b",
         text, re.IGNORECASE
     )
+    # "<N>-day(s) terms/payment/due", e.g. "15-day payment terms"
+    if not phrase_match:
+        phrase_match = re.search(
+            rf"([a-zA-Z0-9\- ]+?)[\s\-]*{unit_alt}\s*(?:payment\s+terms?|terms?|due|credit)\b",
+            text, re.IGNORECASE
+        )
+    # "terms: 15 days", "payment due: 15 days", "due within 15 days of invoice"
+    if not phrase_match:
+        phrase_match = re.search(
+            rf"(?:terms?|payment(?:\s+due)?|credit\s+period)\s*[:\-]?\s*([a-zA-Z0-9\- ]+?)\s+{unit_alt}\b",
+            text, re.IGNORECASE
+        )
+    # last resort: any bare "<N> days/weeks/months" in the text
+    if not phrase_match:
+        phrase_match = re.search(
+            rf"\b([a-zA-Z0-9\-]+)\s+{unit_alt}\b",
+            text, re.IGNORECASE
+        )
+
     if phrase_match:
         qty_text = phrase_match.group(1).strip()
         unit = phrase_match.group(2).lower()
