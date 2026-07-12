@@ -5,7 +5,6 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, ConfigDict
-from dateutil import parser as dateparser
 from groq import Groq
 
 app = FastAPI()
@@ -30,202 +29,50 @@ EXPECTED_KEYS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Deterministic helpers (no LLM — same input always gives same output)
-# ---------------------------------------------------------------------------
-
-NUM_WORDS = {
-    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
-    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
-    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
-    "eighteen": 18, "nineteen": 19, "twenty": 20, "thirty": 30, "forty": 40,
-    "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
-    "a": 1, "an": 1
-}
-SCALE_WORDS = {"hundred": 100, "thousand": 1000, "million": 1000000}
-
-
-def words_to_number(text: str) -> int:
-    text = text.lower().replace("-", " ")
-    tokens = [t for t in re.split(r"[\s,]+", text) if t and t != "and"]
-    total, current = 0, 0
-    matched_any = False
-    for tok in tokens:
-        if tok in NUM_WORDS:
-            current += NUM_WORDS[tok]
-            matched_any = True
-        elif tok in SCALE_WORDS:
-            scale = SCALE_WORDS[tok]
-            matched_any = True
-            if scale == 100:
-                current = (current or 1) * scale
-            else:
-                total += (current or 1) * scale
-                current = 0
-    return (total + current) if matched_any else 0
-
-
-CURRENCY_MAP = [
-    (r"\bUSD\b|\$|\bdollars?\b", "USD"),
-    (r"\bEUR\b|€|\beuros?\b", "EUR"),
-    (r"\bGBP\b|£|\bpounds?\s*sterling\b|\bpounds?\b", "GBP"),
-    (r"\bINR\b|₹|\brupees?\b", "INR"),
-    (r"\bJPY\b|¥|\byen\b", "JPY"),
-]
-
-
-def extract_currency(text: str) -> str:
-    for pattern, code in CURRENCY_MAP:
-        if re.search(pattern, text, re.IGNORECASE):
-            return code
-    return "USD"
-
-
-def extract_total_amount(text: str) -> int:
-    label_pattern = re.compile(
-        r"(total amount due|grand total|total due|amount due|total)\s*[:\-]?\s*([^\n\.]{0,80})",
-        re.IGNORECASE
-    )
-    m = label_pattern.search(text)
-    segment = m.group(2) if m else text
-
-    # "12K" style shorthand
-    k_match = re.search(r"([\d,]+(?:\.\d+)?)\s*[kK]\b", segment)
-    if k_match:
-        return int(round(float(k_match.group(1).replace(",", "")) * 1000))
-
-    # digit-based amount, handles both Western (12,480) and Indian (1,24,800) grouping —
-    # stripping commas/currency symbols works for both since digit order is unaffected
-    digit_match = re.search(r"[\$€£¥₹]?\s*(\d[\d,]*)(?:\.\d+)?", segment)
-    if digit_match:
-        raw = digit_match.group(1).replace(",", "")
-        if raw.isdigit():
-            return int(raw)
-
-    # spelled-out numbers
-    words_num = words_to_number(segment)
-    if words_num > 0:
-        return words_num
-
-    # fallback: scan whole document if the labeled segment had nothing
-    if m:
-        digit_match = re.search(r"[\$€£¥₹]?\s*(\d[\d,]*)(?:\.\d+)?", text)
-        if digit_match:
-            raw = digit_match.group(1).replace(",", "")
-            if raw.isdigit():
-                return int(raw)
-        return words_to_number(text)
-
-    return 0
-
-
-def extract_invoice_date(text: str) -> str:
-    label_match = re.search(
-        r"invoice\s*date\s*[:\-]?\s*([A-Za-z0-9,\/\-\. ]{6,25})", text, re.IGNORECASE
-    )
-    candidates = [label_match.group(1)] if label_match else []
-
-    generic_dates = re.findall(
-        r"\b(?:\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|"
-        r"\d{4}-\d{2}-\d{2}|"
-        r"[A-Za-z]+\.?\s+\d{1,2},?\s+\d{4}|"
-        r"\d{1,2}\s+[A-Za-z]+\s+\d{4})\b",
-        text
-    )
-    candidates.extend(generic_dates)
-
-    for cand in candidates:
-        try:
-            dt = dateparser.parse(cand, fuzzy=True, dayfirst=False)
-            if dt:
-                return dt.strftime("%Y-%m-%d")
-        except (ValueError, OverflowError):
-            continue
-    return ""
-
-
-def extract_due_in_days(text: str) -> int:
-    if re.search(r"due\s+on\s+receipt", text, re.IGNORECASE):
-        return 0
-
-    net_match = re.search(r"\bnet\s*(\d+)\b", text, re.IGNORECASE)
-    if net_match:
-        return int(net_match.group(1))
-
-    unit_map = {"day": 1, "week": 7, "fortnight": 14, "month": 30, "year": 365}
-    unit_alt = r"(day|week|fortnight|month|year)s?"
-
-    # "within/in/due in <N> days", "payable within <N> days"
-    phrase_match = re.search(
-        rf"(?:within|in|due in|payable within)\s+([a-zA-Z0-9\- ]+?)\s+{unit_alt}\b",
-        text, re.IGNORECASE
-    )
-    # "<N>-day(s) terms/payment/due", e.g. "15-day payment terms"
-    if not phrase_match:
-        phrase_match = re.search(
-            rf"([a-zA-Z0-9\- ]+?)[\s\-]*{unit_alt}\s*(?:payment\s+terms?|terms?|due|credit)\b",
-            text, re.IGNORECASE
-        )
-    # "terms: 15 days", "payment due: 15 days", "due within 15 days of invoice"
-    if not phrase_match:
-        phrase_match = re.search(
-            rf"(?:terms?|payment(?:\s+due)?|credit\s+period)\s*[:\-]?\s*([a-zA-Z0-9\- ]+?)\s+{unit_alt}\b",
-            text, re.IGNORECASE
-        )
-    # last resort: any bare "<N> days/weeks/months" in the text
-    if not phrase_match:
-        phrase_match = re.search(
-            rf"\b([a-zA-Z0-9\-]+)\s+{unit_alt}\b",
-            text, re.IGNORECASE
-        )
-
-    if phrase_match:
-        qty_text = phrase_match.group(1).strip()
-        unit = phrase_match.group(2).lower()
-        qty = int(qty_text) if qty_text.isdigit() else words_to_number(qty_text)
-        qty = qty or 1
-        return qty * unit_map[unit]
-
-    return 0
-
-
-def extract_is_paid(text: str) -> bool:
-    if re.search(r"paid\s+in\s+full|payment\s+received|fully\s+paid|already\s+paid", text, re.IGNORECASE):
-        return True
-    if re.search(r"awaiting\s+payment|outstanding|unpaid|balance\s+due|payment\s+pending|not\s+yet\s+paid", text, re.IGNORECASE):
-        return False
-    return False
-
-
-def extract_priority(text: str) -> str:
-    if re.search(r"\burgent\b|immediate\s+attention|asap", text, re.IGNORECASE):
-        return "urgent"
-    if re.search(r"high\s+priority|past\s+due|overdue", text, re.IGNORECASE):
-        return "high"
-    if re.search(r"low\s+priority|no\s+rush|whenever\s+convenient", text, re.IGNORECASE):
-        return "low"
-    return "normal"
-
-
-def extract_contact_email(text: str) -> str:
-    m = re.search(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", text)
-    return m.group(0).lower() if m else ""
-
-
-# ---------------------------------------------------------------------------
-# LLM used ONLY for vendor + line_items (the fields regex can't reliably parse)
+# Tool schema — LLM does ALL semantic interpretation
 # ---------------------------------------------------------------------------
 
 TOOL_DEF = {
     "type": "function",
     "function": {
-        "name": "emit_structural_fields",
-        "description": "Emit only the vendor name and line items from the invoice text.",
+        "name": "emit_invoice",
+        "description": "Emit the fully normalized, strongly-typed invoice data.",
         "parameters": {
             "type": "object",
             "properties": {
                 "vendor": {
                     "type": "string",
                     "description": "The biller's proper name, exactly as written in the source text."
+                },
+                "currency": {
+                    "type": "string",
+                    "enum": ["USD", "EUR", "GBP", "INR", "JPY"],
+                    "description": "ISO 4217 code inferred from symbols/words like $, euros, £, pounds sterling, ₹, rupees, yen."
+                },
+                "total_amount": {
+                    "type": "integer",
+                    "description": "Integer in the main unit, no separators/symbols/decimals. Convert spelled-out numbers ('twelve thousand four hundred eighty' -> 12480), comma-grouped (12,480), Indian grouping (1,24,800 -> 124800), and 'K' suffix (12K -> 12000)."
+                },
+                "invoice_date": {
+                    "type": "string",
+                    "description": "Normalized to YYYY-MM-DD."
+                },
+                "due_in_days": {
+                    "type": "integer",
+                    "description": "The number of days until payment is due, as a plain integer, however it is phrased in the text: 'Net 30' -> 30, 'payable within 45 days' -> 45, 'due in two weeks' -> 14, 'due on receipt' -> 0, '15-day terms' -> 15, 'payment terms: 15 days' -> 15, 'one month' -> 30, a fortnight -> 14. Read the whole document for any payment-terms phrasing, not just one fixed pattern."
+                },
+                "is_paid": {
+                    "type": "boolean",
+                    "description": "True if wording indicates payment already made ('paid in full', 'payment received'); false if outstanding/awaiting/unpaid."
+                },
+                "priority": {
+                    "type": "string",
+                    "enum": ["low", "normal", "high", "urgent"],
+                    "description": "Inferred urgency from tone/wording; default 'normal' if nothing indicates otherwise."
+                },
+                "contact_email": {
+                    "type": "string",
+                    "description": "Lowercased contact email address."
                 },
                 "line_items": {
                     "type": "array",
@@ -239,49 +86,49 @@ TOOL_DEF = {
                         },
                         "required": ["sku", "quantity", "unit_price"]
                     }
+                },
+                "item_count": {
+                    "type": "integer",
+                    "description": "Number of line items."
                 }
             },
-            "required": ["vendor", "line_items"]
+            "required": [
+                "vendor", "currency", "total_amount", "invoice_date", "due_in_days",
+                "is_paid", "priority", "contact_email", "line_items", "item_count"
+            ]
         }
     }
 }
 
-SYSTEM_PROMPT = """You extract two fields from a messy invoice document by calling
-emit_structural_fields exactly once:
+SYSTEM_PROMPT = """You are an expert invoice-data extraction engine for a logistics firm's ERP system.
+You will be given raw, messy free-text invoice content. Read the ENTIRE document carefully — payment
+terms, dates, and amounts can be phrased in many different ways and may not follow a fixed template.
+Extract fully normalized, strongly-typed fields and call the `emit_invoice` tool exactly once with the
+complete, final answer. Follow these rules:
+
 - vendor: the biller's proper name, copied exactly as written (preserve capitalization/punctuation).
-- line_items: array of {sku, quantity, unit_price} in the exact order they appear in the text.
-  unit_price is an integer (no decimals/symbols).
-Do not invent data. Call the tool with the complete answer."""
+- currency: map any wording/symbol to ISO 4217: $ or "dollars" -> USD, "euros"/€ -> EUR,
+  "pounds sterling"/£ -> GBP, ₹ or "rupees" -> INR, ¥ or "yen" -> JPY.
+- total_amount: integer in the main unit only (no decimals, symbols, separators). Handle spelled-out
+  numbers, comma-grouped numbers (12,480), Indian digit grouping (1,24,800 -> 124800), and "K" shorthand
+  (12K -> 12000).
+- invoice_date: normalize any date format to YYYY-MM-DD.
+- due_in_days: find whatever phrase describes payment terms anywhere in the document (it may be
+  "Net 30", "payable within 45 days", "due in two weeks", "due on receipt", "15-day terms",
+  "payment terms: 15 days", spelled-out durations, etc.) and convert it to a plain integer number
+  of days. Do not default to 0 unless the text truly says something like "due on receipt" or gives
+  no payment-terms information at all.
+- is_paid: true if text indicates the invoice is already paid/settled; false if outstanding/unpaid.
+- priority: one of low, normal, high, urgent — infer from urgency language; default "normal" if
+  nothing indicates otherwise.
+- contact_email: the invoice's contact email address, all lowercase.
+- line_items: array of {sku, quantity, unit_price} in the exact order they appear. unit_price is an
+  integer (no decimals/symbols).
+- item_count: must equal the length of the line_items array.
 
-
-def extract_structural_fields(text: str) -> dict:
-    last_error = None
-    for _ in range(3):
-        try:
-            response = client.chat.completions.create(
-                model=MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Extract vendor and line_items from this document:\n\n{text}"}
-                ],
-                tools=[TOOL_DEF],
-                tool_choice={"type": "function", "function": {"name": "emit_structural_fields"}},
-                temperature=0,
-                seed=42,
-                timeout=25,
-            )
-            message = response.choices[0].message
-            tool_calls = getattr(message, "tool_calls", None)
-            if not tool_calls:
-                raise ValueError("Model did not return a tool call")
-            raw = json.loads(tool_calls[0].function.arguments)
-            if not isinstance(raw, dict):
-                raise ValueError("Tool arguments were not a JSON object")
-            return raw
-        except Exception as e:
-            last_error = e
-            continue
-    raise HTTPException(status_code=502, detail=f"Structural extraction failed: {last_error}")
+Be precise and deterministic — given the same document, always produce the same answer.
+Do not invent data not present or reasonably inferable from the text.
+You MUST call emit_invoice — never reply with plain text."""
 
 
 def _safe_int(value, default=0):
@@ -298,10 +145,35 @@ def _safe_int(value, default=0):
     return default
 
 
-def extract_invoice(text: str) -> dict:
-    structural = extract_structural_fields(text)
+def normalize_output(data: dict) -> dict:
+    """Type-safety net only — never re-derives semantics, just casts/cleans
+    whatever the LLM already correctly interpreted."""
 
-    raw_items = structural.get("line_items", [])
+    out = {}
+    out["vendor"] = str(data.get("vendor", "")).strip()
+
+    currency = str(data.get("currency", "")).strip().upper()
+    if currency not in {"USD", "EUR", "GBP", "INR", "JPY"}:
+        currency = currency[:3] if len(currency) >= 3 else currency
+    out["currency"] = currency
+
+    out["total_amount"] = _safe_int(data.get("total_amount", 0))
+    out["invoice_date"] = str(data.get("invoice_date", "")).strip()
+    out["due_in_days"] = _safe_int(data.get("due_in_days", 0))
+
+    is_paid = data.get("is_paid", False)
+    if isinstance(is_paid, str):
+        is_paid = is_paid.strip().lower() in {"true", "yes", "paid"}
+    out["is_paid"] = bool(is_paid)
+
+    priority = str(data.get("priority", "normal")).strip().lower()
+    if priority not in {"low", "normal", "high", "urgent"}:
+        priority = "normal"
+    out["priority"] = priority
+
+    out["contact_email"] = str(data.get("contact_email", "")).strip().lower()
+
+    raw_items = data.get("line_items", [])
     if not isinstance(raw_items, list):
         raw_items = []
     line_items = []
@@ -313,19 +185,41 @@ def extract_invoice(text: str) -> dict:
             "quantity": _safe_int(item.get("quantity", 0)),
             "unit_price": _safe_int(item.get("unit_price", 0)),
         })
+    out["line_items"] = line_items
+    out["item_count"] = len(line_items)  # always derived, never trusted blindly
 
-    return {
-        "vendor": str(structural.get("vendor", "")).strip(),
-        "currency": extract_currency(text),
-        "total_amount": extract_total_amount(text),
-        "invoice_date": extract_invoice_date(text),
-        "due_in_days": extract_due_in_days(text),
-        "is_paid": extract_is_paid(text),
-        "priority": extract_priority(text),
-        "contact_email": extract_contact_email(text),
-        "line_items": line_items,
-        "item_count": len(line_items),
-    }
+    return out
+
+
+def extract_invoice(text: str) -> dict:
+    last_error = None
+    for _ in range(3):
+        try:
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Extract the invoice data from this document:\n\n{text}"}
+                ],
+                tools=[TOOL_DEF],
+                tool_choice={"type": "function", "function": {"name": "emit_invoice"}},
+                temperature=0,
+                seed=42,
+                timeout=25,
+            )
+            message = response.choices[0].message
+            tool_calls = getattr(message, "tool_calls", None)
+            if not tool_calls:
+                raise ValueError("Model did not return a tool call")
+            raw_data = json.loads(tool_calls[0].function.arguments)
+            if not isinstance(raw_data, dict):
+                raise ValueError("Tool arguments were not a JSON object")
+            return normalize_output(raw_data)
+        except Exception as e:
+            last_error = e
+            continue
+
+    raise HTTPException(status_code=502, detail=f"Extraction failed after retries: {last_error}")
 
 
 @app.post("/")
